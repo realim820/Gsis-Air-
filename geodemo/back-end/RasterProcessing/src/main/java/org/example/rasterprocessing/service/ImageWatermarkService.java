@@ -20,8 +20,12 @@ public class ImageWatermarkService {
 
     // DCT块大小
     private static final int DCT_BLOCK_SIZE = 8;
-    // 水印强度
-    private static final double WATERMARK_STRENGTH = 30.0;
+    // 水印强度 - 进一步提高以支持UTF-8
+    private static final double WATERMARK_STRENGTH = 35.0;
+    // 最大修改阈值
+    private static final double MAX_MODIFICATION = 40.0;
+    // 超强纠错编码 - 专门针对UTF-8
+    private static final int REPETITION_COUNT = 7; // 7次重复，提供极强的纠错能力
 
     /**
      * 在普通图像中嵌入DCT暗水印
@@ -150,47 +154,65 @@ public class ImageWatermarkService {
         // 计算可嵌入的块数量
         int blocksX = adjustedWidth / DCT_BLOCK_SIZE;
         int blocksY = adjustedHeight / DCT_BLOCK_SIZE;
-        int totalBlocks = blocksX * blocksY;
+        int availableBlocks = blocksX * blocksY;
 
-        // 将水印数据转换为二进制位
-        List<Integer> watermarkBits = convertToBinary(watermarkData);
-
+        // 将水印数据转换为二进制位（使用重复编码提高鲁棒性）
+        List<Integer> watermarkBits = convertToBinaryWithRepetition(watermarkData);
+        
+        System.out.println("容量检查: 可用块数=" + availableBlocks + ", 需要位数=" + watermarkBits.size());
+        
         // 确保有足够的块来嵌入水印
-        if (watermarkBits.size() > totalBlocks) {
-            throw new RuntimeException("水印数据过长，超出了可嵌入的容量。最大容量: " + totalBlocks + " 位，实际需要: " + watermarkBits.size() + " 位");
+        if (watermarkBits.size() > availableBlocks) {
+            throw new RuntimeException("水印数据过长，超出了图像容量。图像容量: " + availableBlocks + " 位，实际需要: " + watermarkBits.size() + " 位");
         }
 
         Mat watermarkedChannel = floatChannel.clone();
-
-        // 对每个8x8块进行DCT变换并嵌入水印
         int bitIndex = 0;
+        int processedBlocks = 0;
+        int skippedBlocks = 0;
+
+        // 简化策略：优先使用复杂块，但确保能嵌入所有水印位
         for (int blockY = 0; blockY < blocksY && bitIndex < watermarkBits.size(); blockY++) {
             for (int blockX = 0; blockX < blocksX && bitIndex < watermarkBits.size(); blockX++) {
+                processedBlocks++;
+                
                 // 提取8x8块
                 Rect blockRect = new Rect(blockX * DCT_BLOCK_SIZE, blockY * DCT_BLOCK_SIZE,
                         DCT_BLOCK_SIZE, DCT_BLOCK_SIZE);
                 Mat block = new Mat(watermarkedChannel, blockRect);
 
-                // 进行DCT变换
+                // 计算剩余需要嵌入的位数和剩余可用块数
+                int remainingBits = watermarkBits.size() - bitIndex;
+                int remainingBlocks = (blocksY - blockY) * blocksX - blockX;
+                
+                // 如果是复杂块，直接使用；如果剩余块数不多，强制使用
+                boolean shouldUse = isBlockSuitableForWatermark(block) || remainingBits >= remainingBlocks;
+                
+                if (!shouldUse) {
+                    skippedBlocks++;
+                    continue;
+                }
+
+                // 进行DCT变换和嵌入
                 Mat dctBlock = new Mat();
                 Core.dct(block, dctBlock);
-
-                // 嵌入水印位
+                
                 int bit = watermarkBits.get(bitIndex++);
                 embedBitInDCTBlock(dctBlock, bit);
 
                 // 进行逆DCT变换
                 Mat idctBlock = new Mat();
                 Core.idct(dctBlock, idctBlock);
-
-                // 将处理后的块复制回原图像
                 idctBlock.copyTo(block);
 
-                // 释放临时Mat对象
+                // 释放资源
                 dctBlock.release();
                 idctBlock.release();
             }
         }
+
+        System.out.println("嵌入完成: 处理块数=" + processedBlocks + ", 跳过=" + skippedBlocks + 
+                          ", 嵌入位数=" + bitIndex + "/" + watermarkBits.size());
 
         // 转换回原始数据类型
         Mat result = new Mat();
@@ -214,7 +236,7 @@ public class ImageWatermarkService {
     }
 
     /**
-     * 从单个通道中提取水印
+     * 从单个通道中提取水印 - 改进版本，与嵌入策略保持一致
      */
     private String extractWatermarkFromChannel(Mat channel, int watermarkLength) {
         // 确保图像尺寸是8的倍数
@@ -237,13 +259,25 @@ public class ImageWatermarkService {
         int blocksY = adjustedHeight / DCT_BLOCK_SIZE;
 
         List<Integer> extractedBits = new ArrayList<>();
-        int bitsNeeded = watermarkLength * 8; // 每个字符8位
+        int bitsNeeded = getBitsNeededForText(watermarkLength);
+        int totalBlocks = 0;
+        int skippedBlocks = 0;
+        int usedBlocks = 0;
 
+        // 按照与嵌入相同的顺序遍历块
         for (int blockY = 0; blockY < blocksY && extractedBits.size() < bitsNeeded; blockY++) {
             for (int blockX = 0; blockX < blocksX && extractedBits.size() < bitsNeeded; blockX++) {
+                totalBlocks++;
+                
                 Rect blockRect = new Rect(blockX * DCT_BLOCK_SIZE, blockY * DCT_BLOCK_SIZE,
                         DCT_BLOCK_SIZE, DCT_BLOCK_SIZE);
                 Mat block = new Mat(floatChannel, blockRect);
+
+                // 只从适合水印的块中提取，与嵌入时保持一致
+                if (!isBlockSuitableForWatermark(block)) {
+                    skippedBlocks++;
+                    continue; // 跳过这个块，与嵌入时行为一致
+                }
 
                 Mat dctBlock = new Mat();
                 Core.dct(block, dctBlock);
@@ -251,77 +285,339 @@ public class ImageWatermarkService {
                 // 提取二进制位
                 int bit = extractBitFromDCTBlock(dctBlock);
                 extractedBits.add(bit);
+                usedBlocks++;
 
                 dctBlock.release();
             }
         }
 
+        // 输出统计信息用于调试
+        System.out.println("水印提取统计: 总块数=" + totalBlocks + ", 跳过=" + skippedBlocks + 
+                          ", 使用=" + usedBlocks + ", 需要=" + bitsNeeded + ", 提取到=" + extractedBits.size());
+
         // 释放资源
         adjustedChannel.release();
         floatChannel.release();
 
-        // 将二进制位转换回字符串
-        return convertBinaryToString(extractedBits);
+        // 将二进制位转换回字符串（使用重复解码）
+        return convertBinaryToStringWithRepetition(extractedBits);
     }
 
     /**
-     * 在DCT块中嵌入单个二进制位
+     * 在DCT块中嵌入单个二进制位 - 高准确性版本
      */
     private void embedBitInDCTBlock(Mat dctBlock, int bit) {
-        // 选择中频系数位置进行嵌入
-        int[] pos1 = {2, 3}; // 位置1
-        int[] pos2 = {3, 2}; // 位置2
+        // 使用多个中频位置提高鲁棒性（增加到6个位置）
+        int[][] positions = {{2, 3}, {3, 2}, {1, 4}, {4, 1}, {2, 4}, {4, 2}};
 
-        // 获取选定位置的DCT系数
-        double[] coeff1 = dctBlock.get(pos1[0], pos1[1]);
-        double[] coeff2 = dctBlock.get(pos2[0], pos2[1]);
+        for (int[] pos : positions) {
+            double[] coeff = dctBlock.get(pos[0], pos[1]);
 
-        if (coeff1 != null && coeff2 != null && coeff1.length > 0 && coeff2.length > 0) {
-            double c1 = coeff1[0];
-            double c2 = coeff2[0];
+            if (coeff != null && coeff.length > 0) {
+                double originalValue = coeff[0];
+                double newValue;
 
-            // 根据水印位调整系数关系
-            if (bit == 1) {
-                // 确保 c1 > c2
-                if (c1 <= c2) {
-                    double avg = (c1 + c2) / 2;
-                    c1 = avg + WATERMARK_STRENGTH;
-                    c2 = avg - WATERMARK_STRENGTH;
+                // 更强的修改策略
+                if (bit == 1) {
+                    // 正向强化
+                    newValue = originalValue + WATERMARK_STRENGTH;
+                } else {
+                    // 负向强化
+                    newValue = originalValue - WATERMARK_STRENGTH;
                 }
-            } else {
-                // 确保 c1 < c2
-                if (c1 >= c2) {
-                    double avg = (c1 + c2) / 2;
-                    c1 = avg - WATERMARK_STRENGTH;
-                    c2 = avg + WATERMARK_STRENGTH;
+
+                // 确保修改足够明显，但不超过最大限制
+                double modification = Math.abs(newValue - originalValue);
+                if (modification < WATERMARK_STRENGTH * 0.8) {
+                    // 如果修改幅度不够，强制增强
+                    if (bit == 1) {
+                        newValue = originalValue + WATERMARK_STRENGTH;
+                    } else {
+                        newValue = originalValue - WATERMARK_STRENGTH;
+                    }
                 }
+
+                // 限制最大修改幅度，保护视觉质量
+                if (modification > MAX_MODIFICATION) {
+                    if (newValue > originalValue) {
+                        newValue = originalValue + MAX_MODIFICATION;
+                    } else {
+                        newValue = originalValue - MAX_MODIFICATION;
+                    }
+                }
+
+                // 更新DCT系数
+                dctBlock.put(pos[0], pos[1], newValue);
             }
-
-            // 更新DCT系数
-            dctBlock.put(pos1[0], pos1[1], c1);
-            dctBlock.put(pos2[0], pos2[1], c2);
         }
     }
 
     /**
-     * 从DCT块中提取二进制位
+     * 从DCT块中提取二进制位 - 高准确性版本
      */
     private int extractBitFromDCTBlock(Mat dctBlock) {
-        int[] pos1 = {2, 3};
-        int[] pos2 = {3, 2};
+        // 使用与嵌入相同的多个位置（增加到6个位置）
+        int[][] positions = {{2, 3}, {3, 2}, {1, 4}, {4, 1}, {2, 4}, {4, 2}};
+        
+        // 使用加权投票机制
+        double totalScore = 0;
+        int validPositions = 0;
 
-        double[] coeff1 = dctBlock.get(pos1[0], pos1[1]);
-        double[] coeff2 = dctBlock.get(pos2[0], pos2[1]);
-
-        if (coeff1 != null && coeff2 != null && coeff1.length > 0 && coeff2.length > 0) {
-            return coeff1[0] > coeff2[0] ? 1 : 0;
+        for (int[] pos : positions) {
+            double[] coeff = dctBlock.get(pos[0], pos[1]);
+            if (coeff != null && coeff.length > 0) {
+                double value = coeff[0];
+                // 累积系数值，正值支持1，负值支持0
+                totalScore += value;
+                validPositions++;
+            }
         }
 
-        return 0; // 默认返回0
+        if (validPositions == 0) {
+            return 0; // 默认返回0
+        }
+
+        // 基于平均值判断，使用更宽松的阈值
+        double averageScore = totalScore / validPositions;
+        
+        // 进一步降低阈值，提高敏感度（从5%降到2%）
+        double threshold = WATERMARK_STRENGTH * 0.02; // 2%的阈值，极高敏感度
+        
+        if (averageScore > threshold) {
+            return 1;
+        } else if (averageScore < -threshold) {
+            return 0;
+        } else {
+            // 在阈值范围内，使用更细粒度的判断
+            return averageScore > 0 ? 1 : 0;
+        }
     }
 
     /**
-     * 将字符串转换为二进制位列表
+     * 检查8x8块是否适合嵌入水印
+     * 更精确的质量评估
+     */
+    private boolean isBlockSuitableForWatermark(Mat block) {
+        // 计算块的方差和梯度
+        Scalar mean = Core.mean(block);
+        Mat temp = new Mat();
+        Core.subtract(block, mean, temp);
+        Core.multiply(temp, temp, temp);
+        Scalar variance = Core.mean(temp);
+        temp.release();
+
+        double varianceValue = variance.val[0];
+        double meanValue = mean.val[0];
+        
+        // 多重检查标准
+        // 1. 方差检查：避免过于平滑的区域
+        boolean hasGoodVariance = varianceValue > 15.0; // 降低阈值但仍过滤纯色
+        
+        // 2. 避免极值区域（过亮或过暗）
+        boolean notExtremeValue = meanValue > 20 && meanValue < 235;
+        
+        // 3. 避免纯色块
+        boolean notPureColor = varianceValue > 1.0;
+        
+        // 优先级：有良好方差的非极值区域 > 非纯色区域
+        return (hasGoodVariance && notExtremeValue) || notPureColor;
+    }
+
+    /**
+     * 评估块的水印嵌入质量得分
+     */
+    private double evaluateBlockQuality(Mat block) {
+        Scalar mean = Core.mean(block);
+        Mat temp = new Mat();
+        Core.subtract(block, mean, temp);
+        Core.multiply(temp, temp, temp);
+        Scalar variance = Core.mean(temp);
+        temp.release();
+
+        double varianceValue = variance.val[0];
+        double meanValue = mean.val[0];
+        
+        // 计算质量得分
+        double score = 0;
+        
+        // 方差得分（更高的方差 = 更好的嵌入环境）
+        score += Math.min(varianceValue / 100.0, 1.0) * 50;
+        
+        // 中间亮度得分（避免极端亮度）
+        double brightnessScore = 1.0 - Math.abs(127.5 - meanValue) / 127.5;
+        score += brightnessScore * 30;
+        
+        // 纹理复杂度得分
+        if (varianceValue > 50) score += 20;
+        
+        return score;
+    }    /**
+     * 将字符串转换为二进制位列表（UTF-8编码 + 重复编码）
+     */
+    private List<Integer> convertToBinaryWithRepetition(String text) {
+        List<Integer> bits = new ArrayList<>();
+        
+        try {
+            // 使用UTF-8编码
+            byte[] bytes = text.getBytes("UTF-8");
+            
+            // 添加长度信息（用于解码时确定边界）
+            int length = bytes.length;
+            for (int i = 7; i >= 0; i--) {
+                int bit = (length >> i) & 1;
+                // 每个位重复REPETITION_COUNT次
+                for (int rep = 0; rep < REPETITION_COUNT; rep++) {
+                    bits.add(bit);
+                }
+            }
+            
+            // 转换每个字节为二进制
+            for (byte b : bytes) {
+                int unsignedByte = b & 0xFF; // 转换为无符号整数
+                for (int i = 7; i >= 0; i--) {
+                    int bit = (unsignedByte >> i) & 1;
+                    // 每个位重复REPETITION_COUNT次
+                    for (int rep = 0; rep < REPETITION_COUNT; rep++) {
+                        bits.add(bit);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            throw new RuntimeException("UTF-8编码失败: " + e.getMessage(), e);
+        }
+        
+        return bits;
+    }
+
+    /**
+     * 将二进制位列表转换为字符串（UTF-8解码 + 重复解码） - 增强容错版本
+     */
+    private String convertBinaryToStringWithRepetition(List<Integer> bits) {
+        try {
+            if (bits.size() < 8 * REPETITION_COUNT) {
+                System.err.println("提取的位数不足，尝试简单解码");
+                return convertBinaryToString(bits);
+            }
+            
+            // 首先解码长度信息
+            int lengthBits = 8 * REPETITION_COUNT;
+            int length = 0;
+            for (int i = 0; i < 8; i++) {
+                // 使用多数投票恢复每个位
+                int vote = 0;
+                for (int rep = 0; rep < REPETITION_COUNT; rep++) {
+                    int bitIndex = i * REPETITION_COUNT + rep;
+                    if (bitIndex < bits.size()) {
+                        vote += bits.get(bitIndex);
+                    }
+                }
+                int recoveredBit = vote > REPETITION_COUNT / 2 ? 1 : 0;
+                length = (length << 1) | recoveredBit;
+            }
+            
+            // 长度合理性检查和调整（更宽松的范围）
+            if (length <= 0 || length > 200) {
+                // 如果长度信息损坏，根据剩余位数估算
+                int remainingBits = bits.size() - lengthBits;
+                length = Math.min(remainingBits / (8 * REPETITION_COUNT), 50); // 最多50字节
+                System.err.println("长度信息可能损坏，估算长度: " + length);
+            }
+            
+            // 解码字节数据
+            List<Byte> byteList = new ArrayList<>();
+            int startIndex = lengthBits;
+            int successfulBytes = 0;
+            
+            for (int byteIndex = 0; byteIndex < length && startIndex + 8 * REPETITION_COUNT <= bits.size(); byteIndex++) {
+                int byteValue = 0;
+                boolean byteValid = true;
+                
+                for (int bitIndex = 0; bitIndex < 8; bitIndex++) {
+                    // 使用严格的多数投票机制
+                    int vote = 0;
+                    int totalVotes = 0;
+                    
+                    for (int rep = 0; rep < REPETITION_COUNT; rep++) {
+                        int bitPos = startIndex + bitIndex * REPETITION_COUNT + rep;
+                        if (bitPos < bits.size()) {
+                            vote += bits.get(bitPos);
+                            totalVotes++;
+                        }
+                    }
+                    
+                    if (totalVotes == 0) {
+                        byteValid = false;
+                        break;
+                    }
+                    
+                    // 降低投票阈值至50%，但增加额外的UTF-8字节验证
+                    int threshold = Math.max(1, totalVotes / 2);
+                    int recoveredBit = vote >= threshold ? 1 : 0;
+                    
+                    // 额外检查：如果投票过于接近，标记为可疑
+                    if (Math.abs(vote - (totalVotes - vote)) <= 1 && totalVotes >= 3) {
+                        // 投票太接近，可能是噪声，采用保守策略
+                        recoveredBit = vote > totalVotes / 2 ? 1 : 0;
+                    }
+                    
+                    byteValue = (byteValue << 1) | recoveredBit;
+                }
+                
+                if (byteValid) {
+                    byteList.add((byte) byteValue);
+                    successfulBytes++;
+                }
+                startIndex += 8 * REPETITION_COUNT;
+            }
+            
+            if (successfulBytes == 0) {
+                System.err.println("未能成功解码任何字节，回退到简单解码");
+                return convertBinaryToString(bits);
+            }
+            
+            // 转换为字节数组
+            byte[] byteArray = new byte[byteList.size()];
+            for (int i = 0; i < byteList.size(); i++) {
+                byteArray[i] = byteList.get(i);
+            }
+            
+            // 使用UTF-8解码
+            String result = new String(byteArray, "UTF-8");
+            
+            // 检查结果是否合理（更宽松的验证）
+            if (result.trim().isEmpty()) {
+                System.err.println("UTF-8解码结果为空，回退到简单解码");
+                return convertBinaryToString(bits);
+            }
+            
+            // 检查是否包含过多控制字符（但允许正常的UTF-8字符）
+            long controlChars = result.chars().filter(c -> c < 32 && c != 9 && c != 10 && c != 13).count();
+            if (controlChars > result.length() / 2) {
+                System.err.println("UTF-8解码结果包含过多控制字符，回退到简单解码");
+                return convertBinaryToString(bits);
+            }
+            
+            return result;
+            
+        } catch (Exception e) {
+            System.err.println("UTF-8解码失败: " + e.getMessage());
+            // 回退到简单解码
+            return convertBinaryToString(bits);
+        }
+    }
+
+    /**
+     * 计算UTF-8文本需要的位数（包括重复编码）
+     */
+    private int getBitsNeededForText(int characterCount) {
+        // 估算：每个中文字符平均3字节，英文1字节，取平均2.5字节
+        int estimatedBytes = (int) Math.ceil(characterCount * 2.5);
+        // 长度信息8位 + 数据位，都需要重复编码
+        return (8 + estimatedBytes * 8) * REPETITION_COUNT;
+    }
+
+    /**
+     * 原始的ASCII编码方法（保持兼容性）
      */
     private List<Integer> convertToBinary(String text) {
         List<Integer> bits = new ArrayList<>();
@@ -364,5 +660,9 @@ public class ImageWatermarkService {
 
         return result.toString();
     }
+
+    /**
+     * 计算UTF-8文本需要的位数（包括重复编码）
+     */
 
 }
