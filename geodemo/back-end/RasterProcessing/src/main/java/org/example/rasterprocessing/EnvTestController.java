@@ -4,6 +4,7 @@ import org.example.rasterprocessing.model.RasterInfo;
 import org.example.rasterprocessing.model.WatermarkResult;
 import org.example.rasterprocessing.service.RasterReaderService;
 import org.example.rasterprocessing.service.WatermarkService;
+import org.example.rasterprocessing.service.UniversalWatermarkService;
 import org.example.rasterprocessing.util.TestDataGenerator;
 import org.gdal.gdal.Dataset;
 import org.gdal.gdal.gdal;
@@ -22,7 +23,7 @@ public class EnvTestController {
     private RasterReaderService rasterReaderService;
     
     @Autowired
-    private WatermarkService watermarkService;
+    private UniversalWatermarkService universalWatermarkService;
 
     static {
         try {
@@ -139,13 +140,13 @@ public class EnvTestController {
             }
             
             // 嵌入水印
-            WatermarkResult embedResult = watermarkService.embedWatermark(inputPath, outputPath, watermarkText);
+            WatermarkResult embedResult = universalWatermarkService.embedWatermark(inputPath, outputPath, watermarkText);
             if (!embedResult.isSuccess()) {
                 return "水印嵌入失败: " + embedResult.getMessage();
             }
             
             // 提取水印
-            String extractedWatermark = watermarkService.extractWatermark(outputPath, watermarkText.length());
+            String extractedWatermark = universalWatermarkService.extractWatermark(outputPath, watermarkText.length());
             
             return String.format("水印测试成功！嵌入: '%s', 提取: '%s', 处理时间: %dms", 
                     watermarkText, extractedWatermark, embedResult.getProcessingTime());
@@ -155,24 +156,79 @@ public class EnvTestController {
         }
     }
 
+    @GetMapping("/test/image-watermark")
+    public String testImageWatermark() {
+        try {
+            String inputPath = "testdata/test.png";
+            String outputPath = "testdata/watermarked_image.png";
+            String watermarkText = "IMG123";
+            
+            // 检查输入文件是否存在
+            File inputFile = new File(inputPath);
+            if (!inputFile.exists()) {
+                return "测试图像文件不存在: " + inputPath + "，请手动添加一个PNG图像文件";
+            }
+            
+            // 嵌入水印
+            WatermarkResult embedResult = universalWatermarkService.embedWatermark(inputPath, outputPath, watermarkText);
+            if (!embedResult.isSuccess()) {
+                return "图像水印嵌入失败: " + embedResult.getMessage();
+            }
+            
+            // 提取水印
+            String extractedWatermark = universalWatermarkService.extractWatermark(outputPath, watermarkText.length());
+            
+            return String.format("图像水印测试成功！嵌入: '%s', 提取: '%s', 处理时间: %dms", 
+                    watermarkText, extractedWatermark, embedResult.getProcessingTime());
+                    
+        } catch (Exception e) {
+            return "图像水印测试失败: " + e.getMessage();
+        }
+    }
+
+    @GetMapping("/test/universal-watermark")
+    public String testUniversalWatermark() {
+        StringBuilder result = new StringBuilder();
+        result.append("=== 通用水印功能测试 ===<br>");
+        
+        try {
+            // 测试TIFF栅格数据水印
+            result.append("1. TIFF栅格数据水印测试: ").append(testWatermark()).append("<br>");
+            
+            // 测试PNG图像水印
+            result.append("2. PNG图像水印测试: ").append(testImageWatermark()).append("<br>");
+            
+        } catch (Exception e) {
+            result.append("通用水印测试失败: ").append(e.getMessage()).append("<br>");
+        }
+        
+        return result.toString();
+    }
+
     @GetMapping("/test/all")
     public String testAll() {
         StringBuilder result = new StringBuilder();
         
         try {
-            result.append("=== 完整功能测试 ===\n");
+            result.append("=== 完整功能测试 ===<br>");
             
             // 测试GDAL
-            result.append("1. GDAL测试: ").append(testGdal()).append("\n");
+            result.append("1. GDAL测试: ").append(testGdal()).append("<br>");
             
             // 测试OpenCV
-            result.append("2. OpenCV测试: ").append(testOpenCV()).append("\n");
+            result.append("2. OpenCV测试: ").append(testOpenCV()).append("<br>");
             
             // 测试栅格信息读取
-            result.append("3. 栅格信息读取测试: ").append(testRasterInfo()).append("\n");
+            result.append("3. 栅格信息读取测试: ").append(testRasterInfo()).append("<br>");
             
-            // 测试水印功能
-            result.append("4. DCT水印测试: ").append(testWatermark()).append("\n");
+            // 测试栅格水印功能
+            result.append("4. 栅格DCT水印测试: ").append(testWatermark()).append("<br>");
+            
+            // 测试图像水印功能
+            result.append("5. 图像DCT水印测试: ").append(testImageWatermark()).append("<br>");
+            
+            // 测试通用水印功能
+            result.append("6. 通用水印功能测试: 通过自动类型判断完成<br>");
             
             result.append("=== 所有测试完成 ===");
             
@@ -180,6 +236,6 @@ public class EnvTestController {
             result.append("测试过程中发生错误: ").append(e.getMessage());
         }
         
-        return result.toString().replace("\n", "<br>");
+        return result.toString();
     }
 }
